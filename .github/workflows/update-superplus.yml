@@ -38,39 +38,235 @@ jobs:
           osmium export fuel-stations.osm.pbf \
             -o fuel-stations.geojson
 
-      - name: Create Super Plus GeoJSON
+      - name: Create deduplicated Super Plus GeoJSON
         run: |
           mkdir -p data
 
           python3 - <<'PY'
           import json
-          from datetime import datetime, timezone
+          import math
+          import re
+          from collections import defaultdict
 
           with open("fuel-stations.geojson", encoding="utf-8") as f:
               source = json.load(f)
 
-          stations = []
+          def normalize(value):
+              value = str(value or "").strip().casefold()
+              return re.sub(r"\s+", " ", value)
 
+          def position(geometry):
+              if not geometry:
+                  return None
+
+              kind = geometry.get("type")
+              coords = geometry.get("coordinates")
+
+              if not coords:
+                  return None
+
+              if kind == "Point":
+                  return tuple(coords[:2])
+
+              if kind == "Polygon":
+                  rings = [coords[0]]
+
+              elif kind == "MultiPolygon":
+                  rings = [polygon[0] for polygon in coords]
+              else:
+                  return None
+
+              points = [
+                  point for ring in rings for point in ring
+              ]
+
+              if not points:
+                  return None
+
+              return (
+                  sum(p[0] for p in points) / len(points),
+                  sum(p[1] for p in points) / len(points)
+              )
+
+          def distance(a, b):
+              lon1, lat1 = map(math.radians, a)
+              lon2, lat2 = map(math.radians, b)
+
+              dlat = lat2 - lat1
+              dlon = lon2 - lon1
+
+              h = (
+                  math.sin(dlat / 2) ** 2
+                  + math.cos(lat1) * math.cos(lat2)
+                  * math.sin(dlon / 2) ** 2
+              )
+
+              return 6371000 * 2 * math.asin(
+                  min(1, math.sqrt(h))
+              )
+
+          def address(props):
+              street = normalize(
+                  props.get("addr:street")
+              )
+              number = normalize(
+                  props.get("addr:housenumber")
+              )
+              city = normalize(
+                  props.get("addr:city")
+              )
+
+              if street and number:
+                  return (street, number, city)
+
+              return None
+
+          def identity(props):
+              brand = normalize(props.get("brand"))
+              name = normalize(props.get("name"))
+
+              if brand:
+                  return brand
+
+              return name
+
+          def same_station(a, b):
+              pa = a["properties"]
+              pb = b["properties"]
+
+              posa = position(a["geometry"])
+              posb = position(b["geometry"])
+
+              if posa is None or posb is None:
+                  return False
+
+              meters = distance(posa, posb)
+
+              brand_a = normalize(pa.get("brand"))
+              brand_b = normalize(pb.get("brand"))
+
+              if brand_a and brand_b and brand_a != brand_b:
+                  return False
+
+              addr_a = address(pa)
+              addr_b = address(pb)
+
+              if addr_a and addr_b:
+                  if addr_a[:2] == addr_b[:2]:
+                      if (
+                          addr_a[2] and addr_b[2]
+                          and addr_a[2] != addr_b[2]
+                      ):
+                          return False
+
+                      return meters <= 50
+
+                  return False
+
+              id_a = identity(pa)
+              id_b = identity(pb)
+
+              if id_a and id_b and id_a == id_b:
+                  return meters <= 15
+
+              return False
+
+          def quality(feature):
+              props = feature["properties"]
+              geometry = feature["geometry"]
+
+              score = sum(
+                  bool(props.get(key))
+                  for key in (
+                      "name", "brand", "addr:street",
+                      "addr:housenumber", "addr:city",
+                      "opening_hours"
+                  )
+              )
+
+              if geometry.get("type") == "Point":
+                  score += 1
+
+              return score
+
+          stations = []
           for feature in source.get("features", []):
-              props = feature.get("properties", {})
+              props = feature.get("properties") or {}
 
               if props.get("fuel:octane_98") != "yes":
                   continue
 
-              if feature.get("geometry") is None:
+              if position(feature.get("geometry")) is None:
                   continue
 
               stations.append(feature)
 
+          # Prefer the more complete OSM record.
+          stations.sort(key=quality, reverse=True)
+
+          # Spatial grid limits comparison to nearby stations.
+          grid = defaultdict(list)
+          unique = []
+          removed = 0
+          cell_size = 0.0005
+
+          for feature in stations:
+              lon, lat = position(feature["geometry"])
+
+              gx = math.floor(lon / cell_size)
+              gy = math.floor(lat / cell_size)
+
+              duplicate = False
+
+              for dx in (-1, 0, 1):
+                  for dy in (-1, 0, 1):
+                      for candidate in grid[
+                          (gx + dx, gy + dy)
+                      ]:
+                          if same_station(
+                              feature, candidate
+                          ):
+                              duplicate = True
+                              break
+
+                      if duplicate:
+                          break
+
+                  if duplicate:
+                      break
+
+              if duplicate:
+                  removed += 1
+                  continue
+
+              unique.append(feature)
+              grid[(gx, gy)].append(feature)
+
           result = {
               "type": "FeatureCollection",
-              "features": stations
+              "features": unique
           }
 
-          with open("data/superplus98.geojson", "w", encoding="utf-8") as f:
-              json.dump(result, f, ensure_ascii=False)
+          with open(
+              "data/superplus98.geojson",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  result, f, ensure_ascii=False
+              )
 
-          print(f"Super Plus 98: {len(stations)} OSM-Objekte")
+          print(
+              f"Super Plus 98 vorher: "
+              f"{len(stations)} OSM-Objekte"
+          )
+          print(
+              f"Duplikate entfernt: {removed}"
+          )
+          print(
+              f"Super Plus 98 nachher: "
+              f"{len(unique)} Tankstellenobjekte"
+          )
           PY
 
       - name: Commit updated data
@@ -82,6 +278,6 @@ jobs:
           git add data/superplus98.geojson
 
           if ! git diff --cached --quiet; then
-            git commit -m "Update Super Plus 98 data"
+            git commit -m "Deduplicate Super Plus 98 data"
             git push
           fi
