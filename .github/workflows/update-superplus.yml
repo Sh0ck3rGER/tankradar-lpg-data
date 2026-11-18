@@ -1,0 +1,87 @@
+
+name: Update Super Plus 98
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '45 3 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  update-superplus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install osmium
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+
+      - name: Download Germany OSM extract
+        run: |
+          curl -fL --retry 3 \
+            -o germany.osm.pbf \
+            https://download.geofabrik.de/europe/germany-latest.osm.pbf
+
+      - name: Extract Super Plus stations
+        run: |
+          osmium tags-filter germany.osm.pbf \
+            nwr/amenity=fuel \
+            -o fuel-stations.osm.pbf
+
+          osmium export fuel-stations.osm.pbf \
+            -o fuel-stations.geojson
+
+      - name: Create Super Plus GeoJSON
+        run: |
+          mkdir -p data
+
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+
+          with open("fuel-stations.geojson", encoding="utf-8") as f:
+              source = json.load(f)
+
+          stations = []
+
+          for feature in source.get("features", []):
+              props = feature.get("properties", {})
+
+              if props.get("fuel:octane_98") != "yes":
+                  continue
+
+              if feature.get("geometry") is None:
+                  continue
+
+              stations.append(feature)
+
+          result = {
+              "type": "FeatureCollection",
+              "features": stations
+          }
+
+          with open("data/superplus98.geojson", "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False)
+
+          print(f"Super Plus 98: {len(stations)} OSM-Objekte")
+          PY
+
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/superplus98.geojson
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Super Plus 98 data"
+            git push
+          fi
